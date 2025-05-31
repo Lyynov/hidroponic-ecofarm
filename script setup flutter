@@ -1,0 +1,1228 @@
+#!/bin/bash
+# setup_flutter_app.sh - Script setup otomatis untuk Flutter Mobile App
+
+set -e  # Exit on any error
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Function to print colored output
+print_status() {
+    echo -e "${GREEN}[INFO]${NC} $1"
+}
+
+print_warning() {
+    echo -e "${YELLOW}[WARNING]${NC} $1"
+}
+
+print_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
+
+print_header() {
+    echo -e "${BLUE}$1${NC}"
+}
+
+echo "=========================================="
+print_header "IoT Mobile App (Flutter) Setup Script"
+echo "=========================================="
+
+# Check if Flutter is installed
+if ! command -v flutter &> /dev/null; then
+    print_error "Flutter is not installed. Please install Flutter first."
+    echo "Visit: https://docs.flutter.dev/get-started/install"
+    exit 1
+fi
+
+print_status "Flutter found: $(flutter --version | head -n 1)"
+
+# Get server IP configuration
+read -p "Enter Raspberry Pi server IP (default: 192.168.1.100): " SERVER_IP
+SERVER_IP=${SERVER_IP:-192.168.1.100}
+
+# Create project directory
+PROJECT_DIR="iot_monitor_mobile"
+print_status "Creating Flutter project: $PROJECT_DIR"
+
+if [ -d "$PROJECT_DIR" ]; then
+    print_warning "Directory $PROJECT_DIR already exists. Removing..."
+    rm -rf "$PROJECT_DIR"
+fi
+
+flutter create "$PROJECT_DIR"
+cd "$PROJECT_DIR"
+
+# Configure pubspec.yaml
+print_status "Configuring dependencies..."
+cat > pubspec.yaml << EOF
+name: iot_monitor
+description: IoT Monitoring Mobile App
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  http: ^1.1.0
+  fl_chart: ^0.64.0
+  provider: ^6.1.1
+  shared_preferences: ^2.2.2
+  cupertino_icons: ^1.0.6
+  intl: ^0.19.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/
+  fonts:
+    - family: Roboto
+      fonts:
+        - asset: fonts/Roboto-Regular.ttf
+        - asset: fonts/Roboto-Bold.ttf
+          weight: 700
+EOF
+
+# Create assets directory
+mkdir -p assets fonts
+
+# Install dependencies
+print_status "Installing Flutter dependencies..."
+flutter pub get
+
+# Create API configuration
+print_status "Creating API configuration..."
+mkdir -p lib/config
+cat > lib/config/api_config.dart << EOF
+class ApiConfig {
+  static const String baseUrl = 'http://$SERVER_IP:5000/api';
+  static const String serverUrl = 'http://$SERVER_IP:5000';
+  static const Duration timeout = Duration(seconds: 10);
+  static const Duration refreshInterval = Duration(seconds: 10);
+  
+  // API Endpoints
+  static const String dashboard = '/dashboard';
+  static const String nodes = '/nodes';
+  static const String control = '/control';
+  static const String history = '/history';
+  static const String health = '/health';
+  static const String data = '/data';
+}
+EOF
+
+# Create models
+print_status "Creating data models..."
+mkdir -p lib/models
+cat > lib/models/node_model.dart << 'EOF'
+class NodeData {
+  final int nodeId;
+  final String nodeType;
+  final double? temperature;
+  final double? humidity;
+  final double? tds;
+  final bool relayState;
+  final bool manualMode;
+  final String timestamp;
+
+  NodeData({
+    required this.nodeId,
+    required this.nodeType,
+    this.temperature,
+    this.humidity,
+    this.tds,
+    required this.relayState,
+    required this.manualMode,
+    required this.timestamp,
+  });
+
+  factory NodeData.fromJson(Map<String, dynamic> json) {
+    return NodeData(
+      nodeId: json['node_id'] ?? 0,
+      nodeType: json['node_type'] ?? '',
+      temperature: json['temperature']?.toDouble(),
+      humidity: json['humidity']?.toDouble(),
+      tds: json['tds']?.toDouble(),
+      relayState: json['relay_state'] ?? false,
+      manualMode: json['manual_mode'] ?? false,
+      timestamp: json['timestamp'] ?? '',
+    );
+  }
+
+  Map<String, dynamic> toJson() {
+    return {
+      'node_id': nodeId,
+      'node_type': nodeType,
+      'temperature': temperature,
+      'humidity': humidity,
+      'tds': tds,
+      'relay_state': relayState,
+      'manual_mode': manualMode,
+      'timestamp': timestamp,
+    };
+  }
+
+  String get displayName => 'Node $nodeId (${nodeType.toUpperCase()})';
+  
+  String get statusText => relayState ? 'ON' : 'OFF';
+  
+  String get modeText => manualMode ? 'Manual' : 'Auto';
+  
+  String get sensorValues {
+    if (nodeType == 'exhaust') {
+      return '${temperature?.toStringAsFixed(1) ?? '--'}°C, ${humidity?.toStringAsFixed(1) ?? '--'}%';
+    } else {
+      return '${tds?.toStringAsFixed(0) ?? '--'} ppm';
+    }
+  }
+}
+
+class DashboardSummary {
+  final int totalNodes;
+  final int activeRelays;
+  final int manualNodes;
+  final double avgTemperature;
+  final double avgHumidity;
+  final double avgTds;
+
+  DashboardSummary({
+    required this.totalNodes,
+    required this.activeRelays,
+    required this.manualNodes,
+    required this.avgTemperature,
+    required this.avgHumidity,
+    required this.avgTds,
+  });
+
+  factory DashboardSummary.fromJson(Map<String, dynamic> json) {
+    return DashboardSummary(
+      totalNodes: json['total_nodes'] ?? 0,
+      activeRelays: json['active_relays'] ?? 0,
+      manualNodes: json['manual_nodes'] ?? 0,
+      avgTemperature: (json['avg_temperature'] ?? 0).toDouble(),
+      avgHumidity: (json['avg_humidity'] ?? 0).toDouble(),
+      avgTds: (json['avg_tds'] ?? 0).toDouble(),
+    );
+  }
+}
+
+class HistoryData {
+  final int id;
+  final int nodeId;
+  final String nodeType;
+  final double? temperature;
+  final double? humidity;
+  final double? tds;
+  final bool relayState;
+  final String timestamp;
+
+  HistoryData({
+    required this.id,
+    required this.nodeId,
+    required this.nodeType,
+    this.temperature,
+    this.humidity,
+    this.tds,
+    required this.relayState,
+    required this.timestamp,
+  });
+
+  factory HistoryData.fromJson(Map<String, dynamic> json) {
+    return HistoryData(
+      id: json['id'] ?? 0,
+      nodeId: json['node_id'] ?? 0,
+      nodeType: json['node_type'] ?? '',
+      temperature: json['temperature']?.toDouble(),
+      humidity: json['humidity']?.toDouble(),
+      tds: json['tds']?.toDouble(),
+      relayState: json['relay_state'] ?? false,
+      timestamp: json['timestamp'] ?? '',
+    );
+  }
+}
+EOF
+
+# Create API service
+print_status "Creating API service..."
+mkdir -p lib/services
+cat > lib/services/api_service.dart << 'EOF'
+import 'dart:convert';
+import 'dart:io';
+import 'package:http/http.dart' as http;
+import '../config/api_config.dart';
+import '../models/node_model.dart';
+
+class ApiService {
+  static Future<Map<String, dynamic>> getDashboardData() async {
+    try {
+      final response = await http.get(
+        Uri.parse('${ApiConfig.baseUrl}${ApiConfig.dashboard}'),
+        headers: {'Content-Type': 'application/json'},
+      ).timeout(ApiConfig.timeout);
+
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        return {
+          'summary': DashboardSummary.fromJson(data['summary']),
+          'nodes': (data['nodes'] as List)
+              .map((node) => NodeData.fromJson(node))
+              .toList(),
+        };
+      } else {
+        throw HttpException('Server returned ${response.statusCode}');
+      }
+    } on SocketException {
+      throw Exception('No internet connection or server unreachable');
+    } on HttpException catch (e) {
+      throw Exception('HTTP error: ${e.message}');
+    } catch (e) {
+      throw Exception('Network error: $e');
+    }
+  }
+
+  static Future<List<HistoryData>> getNodeHistory(int nodeId, {int hours = 24}) async {
+    try {
+      final response = await http.get(
+        Uri.parse('${ApiConfig.baseUrl}${ApiConfig.history}/$nodeId?hours=$hours'),
+        headers: {'Content-Type': 'application/json'},
+      ).timeout(ApiConfig.timeout);
+
+      if (response.statusCode == 200) {
+        final List<dynamic> data = json.decode(response.body);
+        return data.map((item) => HistoryData.fromJson(item)).toList();
+      } else {
+        throw HttpException('Failed to load history data');
+      }
+    } catch (e) {
+      throw Exception('Network error: $e');
+    }
+  }
+
+  static Future<bool> controlNode(int nodeId, bool manualMode, bool relayCommand) async {
+    try {
+      final response = await http.post(
+        Uri.parse('${ApiConfig.baseUrl}${ApiConfig.control}/$nodeId'),
+        headers: {'Content-Type': 'application/json'},
+        body: json.encode({
+          'manual_mode': manualMode,
+          'relay_command': relayCommand,
+        }),
+      ).timeout(ApiConfig.timeout);
+
+      return response.statusCode == 200;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  static Future<bool> healthCheck() async {
+    try {
+      final response = await http.get(
+        Uri.parse('${ApiConfig.serverUrl}${ApiConfig.health}'),
+        headers: {'Content-Type': 'application/json'},
+      ).timeout(ApiConfig.timeout);
+
+      return response.statusCode == 200;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  static Future<List<NodeData>> getAllNodes() async {
+    try {
+      final response = await http.get(
+        Uri.parse('${ApiConfig.baseUrl}${ApiConfig.nodes}'),
+        headers: {'Content-Type': 'application/json'},
+      ).timeout(ApiConfig.timeout);
+
+      if (response.statusCode == 200) {
+        final List<dynamic> data = json.decode(response.body);
+        return data.map((node) => NodeData.fromJson(node)).toList();
+      } else {
+        throw HttpException('Failed to load nodes');
+      }
+    } catch (e) {
+      throw Exception('Network error: $e');
+    }
+  }
+}
+EOF
+
+# Create main application
+print_status "Creating main application..."
+cat > lib/main.dart << 'EOF'
+import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+import 'providers/iot_provider.dart';
+import 'screens/splash_screen.dart';
+import 'screens/dashboard_screen.dart';
+import 'screens/node_detail_screen.dart';
+import 'utils/app_theme.dart';
+
+void main() {
+  runApp(const IoTMonitorApp());
+}
+
+class IoTMonitorApp extends StatelessWidget {
+  const IoTMonitorApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return ChangeNotifierProvider(
+      create: (context) => IoTProvider(),
+      child: MaterialApp(
+        title: 'IoT Monitor',
+        theme: AppTheme.lightTheme,
+        darkTheme: AppTheme.darkTheme,
+        themeMode: ThemeMode.system,
+        home: const SplashScreen(),
+        routes: {
+          '/dashboard': (context) => const DashboardScreen(),
+          '/node-detail': (context) => const NodeDetailScreen(),
+        },
+        debugShowCheckedModeBanner: false,
+      ),
+    );
+  }
+}
+EOF
+
+# Create theme configuration
+print_status "Creating theme configuration..."
+mkdir -p lib/utils
+cat > lib/utils/app_theme.dart << 'EOF'
+import 'package:flutter/material.dart';
+
+class AppTheme {
+  static const Color primaryColor = Color(0xFF2563EB);
+  static const Color secondaryColor = Color(0xFF10B981);
+  static const Color errorColor = Color(0xFFEF4444);
+  static const Color warningColor = Color(0xFFF59E0B);
+  static const Color surfaceColor = Color(0xFFF8FAFC);
+
+  static ThemeData lightTheme = ThemeData(
+    useMaterial3: true,
+    colorScheme: const ColorScheme.light(
+      primary: primaryColor,
+      secondary: secondaryColor,
+      error: errorColor,
+      surface: surfaceColor,
+    ),
+    appBarTheme: const AppBarTheme(
+      elevation: 0,
+      centerTitle: true,
+      backgroundColor: primaryColor,
+      foregroundColor: Colors.white,
+    ),
+    cardTheme: CardTheme(
+      elevation: 2,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(12),
+      ),
+    ),
+    elevatedButtonTheme: ElevatedButtonThemeData(
+      style: ElevatedButton.styleFrom(
+        backgroundColor: primaryColor,
+        foregroundColor: Colors.white,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(8),
+        ),
+      ),
+    ),
+    inputDecorationTheme: InputDecorationTheme(
+      border: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(8),
+      ),
+      contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+    ),
+  );
+
+  static ThemeData darkTheme = ThemeData(
+    useMaterial3: true,
+    colorScheme: const ColorScheme.dark(
+      primary: primaryColor,
+      secondary: secondaryColor,
+      error: errorColor,
+      surface: Color(0xFF1E293B),
+    ),
+    appBarTheme: const AppBarTheme(
+      elevation: 0,
+      centerTitle: true,
+      backgroundColor: Color(0xFF0F172A),
+      foregroundColor: Colors.white,
+    ),
+    cardTheme: CardTheme(
+      elevation: 2,
+      color: const Color(0xFF334155),
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(12),
+      ),
+    ),
+  );
+}
+
+class AppIcons {
+  static const IconData exhaust = Icons.air;
+  static const IconData pump = Icons.water_drop;
+  static const IconData temperature = Icons.thermostat;
+  static const IconData humidity = Icons.opacity;
+  static const IconData tds = Icons.water;
+  static const IconData relay = Icons.power_settings_new;
+  static const IconData manual = Icons.touch_app;
+  static const IconData auto = Icons.auto_mode;
+  static const IconData refresh = Icons.refresh;
+  static const IconData settings = Icons.settings;
+  static const IconData chart = Icons.show_chart;
+  static const IconData dashboard = Icons.dashboard;
+}
+EOF
+
+# Create splash screen
+print_status "Creating splash screen..."
+mkdir -p lib/screens
+cat > lib/screens/splash_screen.dart << 'EOF'
+import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+import '../providers/iot_provider.dart';
+import '../services/api_service.dart';
+import 'dashboard_screen.dart';
+
+class SplashScreen extends StatefulWidget {
+  const SplashScreen({super.key});
+
+  @override
+  State<SplashScreen> createState() => _SplashScreenState();
+}
+
+class _SplashScreenState extends State<SplashScreen>
+    with SingleTickerProviderStateMixin {
+  late AnimationController _animationController;
+  late Animation<double> _fadeAnimation;
+
+  @override
+  void initState() {
+    super.initState();
+    _animationController = AnimationController(
+      duration: const Duration(seconds: 2),
+      vsync: this,
+    );
+    _fadeAnimation = Tween<double>(begin: 0.0, end: 1.0).animate(
+      CurvedAnimation(parent: _animationController, curve: Curves.easeIn),
+    );
+
+    _animationController.forward();
+    _initializeApp();
+  }
+
+  Future<void> _initializeApp() async {
+    await Future.delayed(const Duration(seconds: 2));
+    
+    // Check server connectivity
+    final isConnected = await ApiService.healthCheck();
+    
+    if (mounted) {
+      if (isConnected) {
+        // Load initial data
+        await context.read<IoTProvider>().loadDashboardData();
+        
+        Navigator.of(context).pushReplacement(
+          MaterialPageRoute(builder: (context) => const DashboardScreen()),
+        );
+      } else {
+        _showConnectionError();
+      }
+    }
+  }
+
+  void _showConnectionError() {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        title: const Text('Connection Error'),
+        content: const Text(
+          'Unable to connect to the IoT server. Please check:\n\n'
+          '• Your device is connected to the same WiFi network\n'
+          '• The Raspberry Pi server is running\n'
+          '• The server IP address is correct',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.of(context).pop();
+              _initializeApp();
+            },
+            child: const Text('Retry'),
+          ),
+          TextButton(
+            onPressed: () {
+              Navigator.of(context).pushReplacement(
+                MaterialPageRoute(builder: (context) => const DashboardScreen()),
+              );
+            },
+            child: const Text('Continue Offline'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  void dispose() {
+    _animationController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Theme.of(context).colorScheme.primary,
+      body: Center(
+        child: FadeTransition(
+          opacity: _fadeAnimation,
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Container(
+                width: 120,
+                height: 120,
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(30),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.black.withOpacity(0.1),
+                      blurRadius: 20,
+                      offset: const Offset(0, 10),
+                    ),
+                  ],
+                ),
+                child: const Icon(
+                  Icons.sensors,
+                  size: 60,
+                  color: Color(0xFF2563EB),
+                ),
+              ),
+              const SizedBox(height: 32),
+              const Text(
+                'IoT Monitor',
+                style: TextStyle(
+                  fontSize: 32,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.white,
+                ),
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                'Smart Agriculture System',
+                style: TextStyle(
+                  fontSize: 16,
+                  color: Colors.white70,
+                ),
+              ),
+              const SizedBox(height: 48),
+              const CircularProgressIndicator(
+                valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+              ),
+              const SizedBox(height: 16),
+              const Text(
+                'Connecting to server...',
+                style: TextStyle(
+                  fontSize: 14,
+                  color: Colors.white70,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+EOF
+
+# Create provider
+print_status "Creating state provider..."
+mkdir -p lib/providers
+cat > lib/providers/iot_provider.dart << 'EOF'
+import 'package:flutter/foundation.dart';
+import '../models/node_model.dart';
+import '../services/api_service.dart';
+
+class IoTProvider with ChangeNotifier {
+  DashboardSummary? _summary;
+  List<NodeData> _nodes = [];
+  List<HistoryData> _historyData = [];
+  NodeData? _selectedNode;
+  bool _isLoading = false;
+  String? _error;
+  DateTime? _lastUpdate;
+  bool _isConnected = false;
+
+  // Getters
+  DashboardSummary? get summary => _summary;
+  List<NodeData> get nodes => _nodes;
+  List<HistoryData> get historyData => _historyData;
+  NodeData? get selectedNode => _selectedNode;
+  bool get isLoading => _isLoading;
+  String? get error => _error;
+  DateTime? get lastUpdate => _lastUpdate;
+  bool get isConnected => _isConnected;
+
+  // Filter nodes by type
+  List<NodeData> get exhaustNodes => _nodes.where((n) => n.nodeType == 'exhaust').toList();
+  List<NodeData> get pumpNodes => _nodes.where((n) => n.nodeType == 'pump').toList();
+
+  Future<void> loadDashboardData() async {
+    _isLoading = true;
+    _error = null;
+    notifyListeners();
+
+    try {
+      final data = await ApiService.getDashboardData();
+      _summary = data['summary'];
+      _nodes = data['nodes'];
+      _lastUpdate = DateTime.now();
+      _isConnected = true;
+      _error = null;
+    } catch (e) {
+      _error = e.toString();
+      _isConnected = false;
+    } finally {
+      _isLoading = false;
+      notifyListeners();
+    }
+  }
+
+  Future<void> selectNode(NodeData node) async {
+    _selectedNode = node;
+    notifyListeners();
+
+    try {
+      _historyData = await ApiService.getNodeHistory(node.nodeId);
+      notifyListeners();
+    } catch (e) {
+      _error = 'Failed to load history: $e';
+      notifyListeners();
+    }
+  }
+
+  Future<bool> controlNode(int nodeId, bool manualMode, bool relayCommand) async {
+    try {
+      final success = await ApiService.controlNode(nodeId, manualMode, relayCommand);
+      if (success) {
+        // Update local node state immediately for better UX
+        final nodeIndex = _nodes.indexWhere((n) => n.nodeId == nodeId);
+        if (nodeIndex != -1) {
+          final updatedNode = NodeData(
+            nodeId: _nodes[nodeIndex].nodeId,
+            nodeType: _nodes[nodeIndex].nodeType,
+            temperature: _nodes[nodeIndex].temperature,
+            humidity: _nodes[nodeIndex].humidity,
+            tds: _nodes[nodeIndex].tds,
+            relayState: relayCommand,
+            manualMode: manualMode,
+            timestamp: _nodes[nodeIndex].timestamp,
+          );
+          _nodes[nodeIndex] = updatedNode;
+          
+          if (_selectedNode?.nodeId == nodeId) {
+            _selectedNode = updatedNode;
+          }
+          notifyListeners();
+        }
+        
+        // Refresh data from server after a short delay
+        Future.delayed(const Duration(seconds: 2), () {
+          loadDashboardData();
+        });
+      }
+      return success;
+    } catch (e) {
+      _error = 'Failed to control node: $e';
+      notifyListeners();
+      return false;
+    }
+  }
+
+  Future<void> checkConnection() async {
+    try {
+      _isConnected = await ApiService.healthCheck();
+      notifyListeners();
+    } catch (e) {
+      _isConnected = false;
+      notifyListeners();
+    }
+  }
+
+  void clearError() {
+    _error = null;
+    notifyListeners();
+  }
+
+  Future<void> refresh() async {
+    await loadDashboardData();
+    if (_selectedNode != null) {
+      await selectNode(_selectedNode!);
+    }
+  }
+
+  void startAutoRefresh() {
+    Future.delayed(const Duration(seconds: 10), () {
+      if (!_isLoading) {
+        loadDashboardData();
+      }
+      startAutoRefresh();
+    });
+  }
+}
+EOF
+
+# Create dashboard screen
+print_status "Creating dashboard screen..."
+cat > lib/screens/dashboard_screen.dart << 'EOF'
+import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+import '../providers/iot_provider.dart';
+import '../models/node_model.dart';
+import '../widgets/summary_card.dart';
+import '../widgets/node_card.dart';
+import '../widgets/connection_indicator.dart';
+import '../utils/app_theme.dart';
+import 'node_detail_screen.dart';
+
+class DashboardScreen extends StatefulWidget {
+  const DashboardScreen({super.key});
+
+  @override
+  State<DashboardScreen> createState() => _DashboardScreenState();
+}
+
+class _DashboardScreenState extends State<DashboardScreen>
+    with WidgetsBindingObserver {
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    
+    // Start auto refresh
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      context.read<IoTProvider>().startAutoRefresh();
+    });
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      context.read<IoTProvider>().refresh();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('IoT Monitor'),
+        actions: [
+          const ConnectionIndicator(),
+          Consumer<IoTProvider>(
+            builder: (context, provider, child) {
+              return IconButton(
+                icon: provider.isLoading
+                    ? const SizedBox(
+                        width: 20,
+                        height: 20,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                        ),
+                      )
+                    : const Icon(AppIcons.refresh),
+                onPressed: provider.isLoading ? null : () => provider.refresh(),
+              );
+            },
+          ),
+        ],
+      ),
+      body: Consumer<IoTProvider>(
+        builder: (context, provider, child) {
+          if (provider.error != null && provider.nodes.isEmpty) {
+            return _buildErrorState(provider);
+          }
+
+          return RefreshIndicator(
+            onRefresh: provider.refresh,
+            child: SingleChildScrollView(
+              physics: const AlwaysScrollableScrollPhysics(),
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  if (provider.lastUpdate != null) ...[
+                    _buildUpdateInfo(provider.lastUpdate!),
+                    const SizedBox(height: 16),
+                  ],
+
+                  if (provider.summary != null) ...[
+                    _buildSectionHeader('System Overview'),
+                    const SizedBox(height: 12),
+                    _buildSummaryGrid(provider.summary!),
+                    const SizedBox(height: 24),
+                  ],
+
+                  _buildSectionHeader('Nodes Status'),
+                  const SizedBox(height: 12),
+                  
+                  if (provider.exhaustNodes.isNotEmpty) ...[
+                    _buildSubsectionHeader('Exhaust Fans', AppIcons.exhaust),
+                    const SizedBox(height: 8),
+                    _buildNodeList(provider.exhaustNodes),
+                    const SizedBox(height: 16),
+                  ],
+
+                  if (provider.pumpNodes.isNotEmpty) ...[
+                    _buildSubsectionHeader('Nutrient Pumps', AppIcons.pump),
+                    const SizedBox(height: 8),
+                    _buildNodeList(provider.pumpNodes),
+                  ],
+
+                  if (provider.nodes.isEmpty && !provider.isLoading) ...[
+                    _buildEmptyState(),
+                  ],
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _buildErrorState(IoTProvider provider) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(32),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(
+              Icons.error_outline,
+              size: 64,
+              color: Theme.of(context).colorScheme.error,
+            ),
+            const SizedBox(height: 16),
+            Text(
+              'Connection Error',
+              style: Theme.of(context).textTheme.headlineSmall,
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 8),
+            Text(
+              provider.error!,
+              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                color: Theme.of(context).colorScheme.error,
+              ),
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 24),
+            ElevatedButton.icon(
+              onPressed: () {
+                provider.clearError();
+                provider.refresh();
+              },
+              icon: const Icon(Icons.refresh),
+              label: const Text('Try Again'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildUpdateInfo(DateTime lastUpdate) {
+    final timeDiff = DateTime.now().difference(lastUpdate);
+    String timeText;
+    
+    if (timeDiff.inMinutes < 1) {
+      timeText = 'Just now';
+    } else if (timeDiff.inMinutes < 60) {
+      timeText = '${timeDiff.inMinutes}m ago';
+    } else {
+      timeText = '${timeDiff.inHours}h ago';
+    }
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      decoration: BoxDecoration(
+        color: Theme.of(context).colorScheme.surface,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(
+          color: Theme.of(context).colorScheme.outline.withOpacity(0.2),
+        ),
+      ),
+      child: Text(
+        'Last updated: $timeText',
+        style: Theme.of(context).textTheme.bodySmall?.copyWith(
+          color: Theme.of(context).colorScheme.onSurface.withOpacity(0.7),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSectionHeader(String title) {
+    return Text(
+      title,
+      style: Theme.of(context).textTheme.headlineSmall?.copyWith(
+        fontWeight: FontWeight.bold,
+      ),
+    );
+  }
+
+  Widget _buildSubsectionHeader(String title, IconData icon) {
+    return Row(
+      children: [
+        Icon(
+          icon,
+          size: 20,
+          color: Theme.of(context).colorScheme.primary,
+        ),
+        const SizedBox(width: 8),
+        Text(
+          title,
+          style: Theme.of(context).textTheme.titleMedium?.copyWith(
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildSummaryGrid(DashboardSummary summary) {
+    return GridView.count(
+      crossAxisCount: 2,
+      shrinkWrap: true,
+      physics: const NeverScrollableScrollPhysics(),
+      mainAxisSpacing: 12,
+      crossAxisSpacing: 12,
+      childAspectRatio: 1.2,
+      children: [
+        SummaryCard(
+          title: 'Total Nodes',
+          value: summary.totalNodes.toString(),
+          icon: AppIcons.dashboard,
+          color: Colors.blue,
+        ),
+        SummaryCard(
+          title: 'Active Relays',
+          value: summary.activeRelays.toString(),
+          icon: AppIcons.relay,
+          color: Colors.green,
+        ),
+        SummaryCard(
+          title: 'Avg Temperature',
+          value: '${summary.avgTemperature.toStringAsFixed(1)}°C',
+          icon: AppIcons.temperature,
+          color: Colors.orange,
+        ),
+        SummaryCard(
+          title: 'Avg TDS',
+          value: '${summary.avgTds.toStringAsFixed(0)} ppm',
+          icon: AppIcons.tds,
+          color: Colors.cyan,
+        ),
+      ],
+    );
+  }
+
+  Widget _buildNodeList(List<NodeData> nodes) {
+    return ListView.builder(
+      shrinkWrap: true,
+      physics: const NeverScrollableScrollPhysics(),
+      itemCount: nodes.length,
+      itemBuilder: (context, index) {
+        final node = nodes[index];
+        return NodeCard(
+          node: node,
+          onTap: () {
+            Navigator.push(
+              context,
+              MaterialPageRoute(
+                builder: (context) => NodeDetailScreen(node: node),
+              ),
+            );
+          },
+          onControlTap: (manualMode, relayState) {
+            _showControlDialog(node, manualMode, relayState);
+          },
+        );
+      },
+    );
+  }
+
+  Widget _buildEmptyState() {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(32),
+        child: Column(
+          children: [
+            Icon(
+              Icons.device_hub_outlined,
+              size: 64,
+              color: Theme.of(context).colorScheme.outline,
+            ),
+            const SizedBox(height: 16),
+            Text(
+              'No Nodes Available',
+              style: Theme.of(context).textTheme.headlineSmall,
+            ),
+            const SizedBox(height: 8),
+            Text(
+              'Make sure your ESP32 nodes are connected and sending data.',
+              style: Theme.of(context).textTheme.bodyMedium,
+              textAlign: TextAlign.center,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _showControlDialog(NodeData node, bool currentManualMode, bool currentRelayState) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text('Control ${node.displayName}'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('Current mode: ${node.modeText}'),
+            Text('Current state: ${node.statusText}'),
+            const SizedBox(height: 16),
+            Text(
+              'Choose action:',
+              style: Theme.of(context).textTheme.titleSmall,
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () {
+              Navigator.pop(context);
+              context.read<IoTProvider>().controlNode(
+                node.nodeId,
+                !currentManualMode,
+                currentRelayState,
+              );
+            },
+            child: Text(currentManualMode ? 'Set Auto' : 'Set Manual'),
+          ),
+          if (currentManualMode)
+            TextButton(
+              onPressed: () {
+                Navigator.pop(context);
+                context.read<IoTProvider>().controlNode(
+                  node.nodeId,
+                  currentManualMode,
+                  !currentRelayState,
+                );
+              },
+              child: Text(currentRelayState ? 'Turn OFF' : 'Turn ON'),
+            ),
+        ],
+      ),
+    );
+  }
+}
+EOF
+
+# Create build script
+print_status "Creating build scripts..."
+cat > build_debug.sh << 'EOF'
+#!/bin/bash
+echo "Building debug APK..."
+flutter clean
+flutter pub get
+flutter build apk --debug
+echo "Debug APK built: build/app/outputs/flutter-apk/app-debug.apk"
+EOF
+
+cat > build_release.sh << 'EOF'
+#!/bin/bash
+echo "Building release APK..."
+flutter clean
+flutter pub get
+flutter build apk --release
+echo "Release APK built: build/app/outputs/flutter-apk/app-release.apk"
+EOF
+
+chmod +x build_debug.sh build_release.sh
+
+# Create test runner
+print_status "Creating test runner..."
+cat > run_tests.sh << 'EOF'
+#!/bin/bash
+echo "Running Flutter tests..."
+flutter test
+echo "Running widget tests..."
+flutter test integration_test/
+EOF
+
+chmod +x run_tests.sh
+
+# Final flutter pub get
+print_status "Final dependency installation..."
+flutter pub get
+
+# Build debug APK
+print_status "Building debug APK for testing..."
+flutter build apk --debug
+
+echo ""
+echo "=========================================="
+print_header "Flutter Mobile App Setup Complete!"
+echo "=========================================="
+echo ""
+echo "Project created at: $(pwd)"
+echo "Server IP configured: $SERVER_IP"
+echo ""
+echo "Available Commands:"
+echo "- Run on device/emulator: flutter run"
+echo "- Build debug APK: ./build_debug.sh"
+echo "- Build release APK: ./build_release.sh"
+echo "- Run tests: ./run_tests.sh"
+echo ""
+echo "APK Location:"
+echo "- Debug: build/app/outputs/flutter-apk/app-debug.apk"
+echo "- Release: build/app/outputs/flutter-apk/app-release.apk"
+echo ""
+echo "Next Steps:"
+echo "1. Connect Android device or start emulator"
+echo "2. Run: flutter run"
+echo "3. Test connectivity with your Raspberry Pi"
+echo ""
+echo "Troubleshooting:"
+echo "- Ensure device and Raspberry Pi are on same network"
+echo "- Check server IP address in lib/config/api_config.dart"
+echo "- Verify Raspberry Pi server is running"
+echo "=========================================="

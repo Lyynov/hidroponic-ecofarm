@@ -1,0 +1,957 @@
+#!/bin/bash
+# setup_raspberry_pi.sh - Script setup otomatis untuk Raspberry Pi
+
+set -e  # Exit on any error
+
+echo "=========================================="
+echo "IoT Gateway Setup Script untuk Raspberry Pi"
+echo "=========================================="
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+# Function to print colored output
+print_status() {
+    echo -e "${GREEN}[INFO]${NC} $1"
+}
+
+print_warning() {
+    echo -e "${YELLOW}[WARNING]${NC} $1"
+}
+
+print_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
+
+# Check if running as root
+if [[ $EUID -eq 0 ]]; then
+   print_error "This script should not be run as root. Please run as pi user."
+   exit 1
+fi
+
+# Step 1: Update system
+print_status "Updating system packages..."
+sudo apt update && sudo apt upgrade -y
+sudo apt install python3-pip python3-venv sqlite3 git curl htop -y
+
+# Step 2: Configure static IP
+print_status "Configuring static IP address..."
+read -p "Enter static IP address (default: 192.168.1.100): " STATIC_IP
+STATIC_IP=${STATIC_IP:-192.168.1.100}
+
+read -p "Enter gateway IP (default: 192.168.1.1): " GATEWAY_IP
+GATEWAY_IP=${GATEWAY_IP:-192.168.1.1}
+
+# Backup original dhcpcd.conf
+sudo cp /etc/dhcpcd.conf /etc/dhcpcd.conf.backup
+
+# Add static IP configuration
+sudo tee -a /etc/dhcpcd.conf > /dev/null << EOF
+
+# IoT Gateway Static IP Configuration
+interface wlan0
+static ip_address=${STATIC_IP}/24
+static routers=${GATEWAY_IP}
+static domain_name_servers=${GATEWAY_IP} 8.8.8.8
+EOF
+
+print_status "Static IP configured: ${STATIC_IP}"
+
+# Step 3: Setup project directory
+print_status "Setting up project directory..."
+cd ~
+mkdir -p iot_gateway backup logs
+
+# Step 4: Create virtual environment
+print_status "Creating Python virtual environment..."
+cd ~/iot_gateway
+python3 -m venv venv
+source venv/bin/activate
+
+# Step 5: Install Python packages
+print_status "Installing Python dependencies..."
+pip install --upgrade pip
+pip install flask flask-cors sqlite3 requests python-dateutil
+
+# Step 6: Create database initialization script
+print_status "Creating database initialization script..."
+cat > ~/iot_gateway/init_db.py << 'EOF'
+import sqlite3
+import os
+
+def init_database():
+    db_path = 'iot_data.db'
+    
+    print("Initializing IoT database...")
+    
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    
+    # Drop existing tables for fresh start
+    cursor.execute('DROP TABLE IF EXISTS sensor_data')
+    cursor.execute('DROP TABLE IF EXISTS node_controls')
+    
+    # Create sensor_data table
+    cursor.execute('''
+        CREATE TABLE sensor_data (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            node_id INTEGER NOT NULL,
+            node_type TEXT NOT NULL,
+            temperature REAL,
+            humidity REAL,
+            tds REAL,
+            relay_state BOOLEAN,
+            manual_mode BOOLEAN,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Create node_controls table
+    cursor.execute('''
+        CREATE TABLE node_controls (
+            node_id INTEGER PRIMARY KEY,
+            manual_mode BOOLEAN DEFAULT FALSE,
+            relay_command BOOLEAN DEFAULT FALSE,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Create indexes for better performance
+    cursor.execute('CREATE INDEX idx_sensor_data_node_timestamp ON sensor_data(node_id, timestamp)')
+    cursor.execute('CREATE INDEX idx_sensor_data_timestamp ON sensor_data(timestamp)')
+    cursor.execute('CREATE INDEX idx_node_controls_updated ON node_controls(updated_at)')
+    
+    # Insert default control states for all 8 nodes
+    for node_id in range(1, 9):
+        cursor.execute('''
+            INSERT INTO node_controls (node_id, manual_mode, relay_command) 
+            VALUES (?, FALSE, FALSE)
+        ''', (node_id,))
+    
+    conn.commit()
+    conn.close()
+    
+    print(f"Database initialized successfully: {os.path.abspath(db_path)}")
+    print("Default control states created for nodes 1-8")
+
+if __name__ == "__main__":
+    init_database()
+EOF
+
+# Step 7: Initialize database
+print_status "Initializing database..."
+cd ~/iot_gateway
+source venv/bin/activate
+python init_db.py
+
+# Step 8: Create main Flask application
+print_status "Creating Flask application..."
+cat > ~/iot_gateway/app.py << 'EOF'
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import sqlite3
+import json
+from datetime import datetime, timedelta
+import threading
+import time
+import logging
+
+app = Flask(__name__)
+CORS(app)  # Enable CORS for web/mobile access
+
+DATABASE = 'iot_data.db'
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('../logs/gateway.log'),
+        logging.StreamHandler()
+    ]
+)
+
+def get_db_connection():
+    """Get database connection"""
+    conn = sqlite3.connect(DATABASE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+@app.route('/api/data', methods=['POST'])
+def receive_sensor_data():
+    """Receive sensor data from ESP32 nodes"""
+    try:
+        data = request.get_json()
+        
+        if not data or 'node_id' not in data:
+            return jsonify({'status': 'error', 'message': 'Invalid data'}), 400
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            INSERT INTO sensor_data 
+            (node_id, node_type, temperature, humidity, tds, relay_state, manual_mode)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            data.get('node_id'),
+            data.get('node_type'),
+            data.get('temperature'),
+            data.get('humidity'),
+            data.get('tds'),
+            data.get('relay_state'),
+            data.get('manual_mode')
+        ))
+        
+        conn.commit()
+        conn.close()
+        
+        logging.info(f"Data received from node {data.get('node_id')}")
+        return jsonify({'status': 'success', 'message': 'Data received'}), 200
+        
+    except Exception as e:
+        logging.error(f"Error receiving data: {str(e)}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/control/<int:node_id>', methods=['GET'])
+def get_control_commands(node_id):
+    """Send control commands to ESP32 nodes"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT manual_mode, relay_command 
+            FROM node_controls 
+            WHERE node_id = ?
+        ''', (node_id,))
+        
+        result = cursor.fetchone()
+        conn.close()
+        
+        if result:
+            return jsonify({
+                'manual_mode': bool(result['manual_mode']),
+                'relay_command': bool(result['relay_command'])
+            }), 200
+        else:
+            return jsonify({'manual_mode': False, 'relay_command': False}), 200
+            
+    except Exception as e:
+        logging.error(f"Error getting control for node {node_id}: {str(e)}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/control/<int:node_id>', methods=['POST'])
+def set_control_commands(node_id):
+    """Set control commands for specific node (from web/mobile)"""
+    try:
+        data = request.get_json()
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            UPDATE node_controls 
+            SET manual_mode = ?, relay_command = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE node_id = ?
+        ''', (
+            data.get('manual_mode', False),
+            data.get('relay_command', False),
+            node_id
+        ))
+        
+        conn.commit()
+        conn.close()
+        
+        logging.info(f"Control updated for node {node_id}: manual={data.get('manual_mode')}, relay={data.get('relay_command')}")
+        return jsonify({'status': 'success', 'message': 'Control updated'}), 200
+        
+    except Exception as e:
+        logging.error(f"Error setting control for node {node_id}: {str(e)}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/dashboard', methods=['GET'])
+def get_dashboard_data():
+    """Get dashboard summary data"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Get latest data for all nodes
+        cursor.execute('''
+            SELECT s1.* FROM sensor_data s1
+            INNER JOIN (
+                SELECT node_id, MAX(timestamp) as max_timestamp
+                FROM sensor_data
+                GROUP BY node_id
+            ) s2 ON s1.node_id = s2.node_id AND s1.timestamp = s2.max_timestamp
+            ORDER BY s1.node_id
+        ''')
+        
+        nodes = cursor.fetchall()
+        
+        # Calculate summary statistics
+        total_nodes = len(nodes)
+        active_relays = sum(1 for node in nodes if node['relay_state'])
+        manual_nodes = sum(1 for node in nodes if node['manual_mode'])
+        
+        # Get average values
+        exhaust_nodes = [node for node in nodes if node['node_type'] == 'exhaust']
+        pump_nodes = [node for node in nodes if node['node_type'] == 'pump']
+        
+        avg_temp = sum(node['temperature'] or 0 for node in exhaust_nodes) / len(exhaust_nodes) if exhaust_nodes else 0
+        avg_humidity = sum(node['humidity'] or 0 for node in exhaust_nodes) / len(exhaust_nodes) if exhaust_nodes else 0
+        avg_tds = sum(node['tds'] or 0 for node in pump_nodes) / len(pump_nodes) if pump_nodes else 0
+        
+        conn.close()
+        
+        return jsonify({
+            'summary': {
+                'total_nodes': total_nodes,
+                'active_relays': active_relays,
+                'manual_nodes': manual_nodes,
+                'avg_temperature': round(avg_temp, 2),
+                'avg_humidity': round(avg_humidity, 2),
+                'avg_tds': round(avg_tds, 2)
+            },
+            'nodes': [{
+                'node_id': node['node_id'],
+                'node_type': node['node_type'],
+                'temperature': node['temperature'],
+                'humidity': node['humidity'],
+                'tds': node['tds'],
+                'relay_state': bool(node['relay_state']),
+                'manual_mode': bool(node['manual_mode']),
+                'timestamp': node['timestamp']
+            } for node in nodes]
+        }), 200
+        
+    except Exception as e:
+        logging.error(f"Error getting dashboard data: {str(e)}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/history/<int:node_id>', methods=['GET'])
+def get_node_history(node_id):
+    """Get historical data for specific node"""
+    try:
+        hours = request.args.get('hours', 24, type=int)
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT * FROM sensor_data 
+            WHERE node_id = ? AND timestamp >= datetime('now', '-{} hours')
+            ORDER BY timestamp DESC
+            LIMIT 1000
+        '''.format(hours), (node_id,))
+        
+        history = []
+        for row in cursor.fetchall():
+            history.append({
+                'id': row['id'],
+                'node_id': row['node_id'],
+                'node_type': row['node_type'],
+                'temperature': row['temperature'],
+                'humidity': row['humidity'],
+                'tds': row['tds'],
+                'relay_state': bool(row['relay_state']),
+                'timestamp': row['timestamp']
+            })
+        
+        conn.close()
+        return jsonify(history), 200
+        
+    except Exception as e:
+        logging.error(f"Error getting history for node {node_id}: {str(e)}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    return jsonify({
+        'status': 'healthy', 
+        'timestamp': datetime.now().isoformat(),
+        'version': '1.0.0'
+    }), 200
+
+@app.route('/api/stats', methods=['GET'])
+def get_stats():
+    """Get system statistics"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('SELECT COUNT(*) as total_records FROM sensor_data')
+        total_records = cursor.fetchone()['total_records']
+        
+        cursor.execute('SELECT COUNT(DISTINCT node_id) as active_nodes FROM sensor_data WHERE timestamp >= datetime("now", "-1 hour")')
+        active_nodes = cursor.fetchone()['active_nodes']
+        
+        conn.close()
+        
+        return jsonify({
+            'total_records': total_records,
+            'active_nodes': active_nodes,
+            'uptime': time.time(),
+            'database_size': os.path.getsize(DATABASE) if os.path.exists(DATABASE) else 0
+        }), 200
+        
+    except Exception as e:
+        logging.error(f"Error getting stats: {str(e)}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+if __name__ == '__main__':
+    logging.info("IoT Gateway Server starting...")
+    logging.info("Database initialized")
+    logging.info("Server running at http://0.0.0.0:5000")
+    app.run(host='0.0.0.0', port=5000, debug=False)
+EOF
+
+# Step 9: Create systemd service
+print_status "Creating systemd service..."
+sudo tee /etc/systemd/system/iot-gateway.service > /dev/null << EOF
+[Unit]
+Description=IoT Gateway Server
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/iot_gateway
+Environment=PATH=/home/pi/iot_gateway/venv/bin
+ExecStart=/home/pi/iot_gateway/venv/bin/python app.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Step 10: Create monitoring scripts
+print_status "Creating monitoring and maintenance scripts..."
+
+# System monitor script
+cat > ~/monitor_system.sh << 'EOF'
+#!/bin/bash
+# System monitoring script
+
+echo "=== IoT Gateway System Monitor ==="
+echo "Date: $(date)"
+echo ""
+
+echo "=== System Resources ==="
+echo "CPU Usage:"
+top -bn1 | grep "Cpu(s)" | awk '{print $2 $3 $4 $5}'
+echo ""
+echo "Memory Usage:"
+free -h
+echo ""
+echo "Disk Usage:"
+df -h | grep -E "(root|home)"
+echo ""
+
+echo "=== Network Status ==="
+echo "IP Address:"
+ip addr show wlan0 | grep "inet " | awk '{print $2}'
+echo ""
+echo "WiFi Signal:"
+iwconfig wlan0 2>/dev/null | grep -E "(ESSID|Signal)" || echo "WiFi info not available"
+echo ""
+
+echo "=== Service Status ==="
+echo "IoT Gateway Service:"
+systemctl is-active iot-gateway.service
+echo ""
+
+echo "=== Database Status ==="
+if [ -f ~/iot_gateway/iot_data.db ]; then
+    echo "Database size: $(ls -lh ~/iot_gateway/iot_data.db | awk '{print $5}')"
+    echo "Total records: $(sqlite3 ~/iot_gateway/iot_data.db 'SELECT COUNT(*) FROM sensor_data;')"
+    echo "Last 5 records:"
+    sqlite3 ~/iot_gateway/iot_data.db "SELECT node_id, node_type, timestamp FROM sensor_data ORDER BY timestamp DESC LIMIT 5;" | column -t -s '|'
+else
+    echo "Database not found!"
+fi
+echo ""
+
+echo "=== Recent Logs ==="
+sudo journalctl -u iot-gateway.service --since "5 minutes ago" --no-pager | tail -n 10
+EOF
+
+chmod +x ~/monitor_system.sh
+
+# Database cleanup script
+cat > ~/cleanup_database.sh << 'EOF'
+#!/bin/bash
+# Database maintenance script
+
+echo "Starting database maintenance..."
+cd ~/iot_gateway
+
+# Create backup directory if not exists
+mkdir -p ~/backup
+
+# Backup current database
+BACKUP_FILE="~/backup/iot_data_$(date +%Y%m%d_%H%M%S).db"
+cp iot_data.db "$BACKUP_FILE"
+echo "Database backed up to: $BACKUP_FILE"
+
+# Delete records older than 30 days
+DELETED_ROWS=$(sqlite3 iot_data.db "DELETE FROM sensor_data WHERE timestamp < datetime('now', '-30 days'); SELECT changes();")
+echo "Deleted $DELETED_ROWS old records"
+
+# Vacuum database to reclaim space
+sqlite3 iot_data.db "VACUUM;"
+echo "Database vacuumed successfully"
+
+# Show current database stats
+TOTAL_RECORDS=$(sqlite3 iot_data.db "SELECT COUNT(*) FROM sensor_data;")
+DB_SIZE=$(ls -lh iot_data.db | awk '{print $5}')
+echo "Current database size: $DB_SIZE"
+echo "Total records: $TOTAL_RECORDS"
+
+echo "Database maintenance completed at $(date)"
+EOF
+
+chmod +x ~/cleanup_database.sh
+
+# Step 11: Create startup script
+cat > ~/start_gateway.sh << 'EOF'
+#!/bin/bash
+# Manual start script for development
+
+cd ~/iot_gateway
+source venv/bin/activate
+
+echo "Starting IoT Gateway Server..."
+echo "Press Ctrl+C to stop"
+python app.py
+EOF
+
+chmod +x ~/start_gateway.sh
+
+# Step 12: Setup cron jobs
+print_status "Setting up cron jobs..."
+(crontab -l 2>/dev/null; echo "0 2 * * 0 ~/cleanup_database.sh >> ~/logs/cleanup.log 2>&1") | crontab -
+(crontab -l 2>/dev/null; echo "*/10 * * * * ~/monitor_system.sh >> ~/logs/monitor.log 2>&1") | crontab -
+
+# Step 13: Enable and start service
+print_status "Enabling and starting IoT Gateway service..."
+sudo systemctl daemon-reload
+sudo systemctl enable iot-gateway.service
+
+# Step 14: Test database and API
+print_status "Testing database and API..."
+cd ~/iot_gateway
+source venv/bin/activate
+
+# Test database
+sqlite3 iot_data.db "SELECT COUNT(*) FROM node_controls;" > /dev/null
+if [ $? -eq 0 ]; then
+    print_status "Database test: PASSED"
+else
+    print_error "Database test: FAILED"
+fi
+
+# Start service for testing
+sudo systemctl start iot-gateway.service
+sleep 5
+
+# Test API endpoint
+if curl -s http://localhost:5000/health > /dev/null; then
+    print_status "API test: PASSED"
+else
+    print_error "API test: FAILED"
+fi
+
+# Step 15: Create configuration file
+print_status "Creating configuration file..."
+cat > ~/iot_gateway/config.py << EOF
+# IoT Gateway Configuration
+DATABASE_PATH = 'iot_data.db'
+SERVER_HOST = '0.0.0.0'
+SERVER_PORT = 5000
+STATIC_IP = '${STATIC_IP}'
+GATEWAY_IP = '${GATEWAY_IP}'
+
+# Node configuration
+EXHAUST_NODES = [1, 2, 3, 4]
+PUMP_NODES = [5, 6, 7, 8]
+
+# Sensor thresholds
+TEMP_THRESHOLD = 30.0  # Celsius
+HUMIDITY_THRESHOLD = 80.0  # Percentage
+TDS_THRESHOLD = 800.0  # PPM
+
+# Timing configuration (seconds)
+DATA_RETENTION_DAYS = 30
+BACKUP_INTERVAL_HOURS = 24
+MONITORING_INTERVAL_MINUTES = 10
+EOF
+
+# Step 16: Create ESP32 configuration generator
+print_status "Creating ESP32 configuration generator..."
+cat > ~/generate_esp32_config.py << 'EOF'
+#!/usr/bin/env python3
+"""
+ESP32 Configuration Generator
+Generates Arduino code with proper configuration for each node
+"""
+
+import os
+
+# WiFi Configuration
+WIFI_SSID = input("Enter WiFi SSID: ")
+WIFI_PASSWORD = input("Enter WiFi Password: ")
+SERVER_IP = input(f"Enter server IP (default: {os.environ.get('STATIC_IP', '192.168.1.100')}): ") or os.environ.get('STATIC_IP', '192.168.1.100')
+
+# Node configurations
+EXHAUST_NODES = [1, 2, 3, 4]
+PUMP_NODES = [5, 6, 7, 8]
+
+def generate_exhaust_config(node_id):
+    return f'''// Configuration for Exhaust Node {node_id}
+const char* ssid = "{WIFI_SSID}";
+const char* password = "{WIFI_PASSWORD}";
+const char* server_ip = "{SERVER_IP}";
+const int server_port = 5000;
+#define NODE_ID {node_id}
+#define DHT_PIN 4
+#define RELAY_PIN 2
+#define DHT_TYPE DHT22
+'''
+
+def generate_pump_config(node_id):
+    return f'''// Configuration for Pump Node {node_id}
+const char* ssid = "{WIFI_SSID}";
+const char* password = "{WIFI_PASSWORD}";
+const char* server_ip = "{SERVER_IP}";
+const int server_port = 5000;
+#define NODE_ID {node_id}
+#define TDS_PIN A0
+#define RELAY_PIN 2
+'''
+
+# Create output directory
+os.makedirs('esp32_configs', exist_ok=True)
+
+# Generate exhaust node configs
+for node_id in EXHAUST_NODES:
+    config = generate_exhaust_config(node_id)
+    with open(f'esp32_configs/node_{node_id}_exhaust_config.h', 'w') as f:
+        f.write(config)
+    print(f"Generated configuration for Exhaust Node {node_id}")
+
+# Generate pump node configs
+for node_id in PUMP_NODES:
+    config = generate_pump_config(node_id)
+    with open(f'esp32_configs/node_{node_id}_pump_config.h', 'w') as f:
+        f.write(config)
+    print(f"Generated configuration for Pump Node {node_id}")
+
+print(f"\nAll ESP32 configurations generated in esp32_configs/ directory")
+print(f"Server IP configured as: {SERVER_IP}")
+print("\nTo use these configurations:")
+print("1. Copy the content of each config file to the respective ESP32 sketch")
+print("2. Replace the configuration section in your Arduino code")
+print("3. Upload to the corresponding ESP32 board")
+EOF
+
+chmod +x ~/generate_esp32_config.py
+
+# Step 17: Create web application setup script
+print_status "Creating web application setup script..."
+cat > ~/setup_web_app.sh << 'EOF'
+#!/bin/bash
+# Web application setup script
+
+print_status() {
+    echo -e "\033[0;32m[INFO]\033[0m $1"
+}
+
+print_status "Setting up React web application..."
+
+# Check if Node.js is installed
+if ! command -v node &> /dev/null; then
+    print_status "Installing Node.js..."
+    curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
+    sudo apt-get install -y nodejs
+fi
+
+# Create web app directory
+mkdir -p ~/iot_web_monitor
+cd ~/iot_web_monitor
+
+# Initialize React app
+if [ ! -f package.json ]; then
+    print_status "Creating React application..."
+    npx create-react-app . --template typescript
+fi
+
+# Install additional dependencies
+print_status "Installing dependencies..."
+npm install axios recharts @types/recharts lucide-react
+
+# Install Tailwind CSS
+npm install -D tailwindcss postcss autoprefixer @tailwindcss/forms
+npx tailwindcss init -p
+
+# Configure Tailwind
+cat > tailwind.config.js << 'TAILWIND_EOF'
+module.exports = {
+  content: [
+    "./src/**/*.{js,jsx,ts,tsx}",
+  ],
+  theme: {
+    extend: {},
+  },
+  plugins: [
+    require('@tailwindcss/forms'),
+  ],
+}
+TAILWIND_EOF
+
+# Configure CSS
+cat > src/index.css << 'CSS_EOF'
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+CSS_EOF
+
+# Create API configuration
+mkdir -p src/config
+cat > src/config/api.ts << 'API_EOF'
+export const API_CONFIG = {
+  BASE_URL: 'http://192.168.1.100:5000/api',
+  TIMEOUT: 10000,
+  REFRESH_INTERVAL: 10000, // 10 seconds
+};
+API_EOF
+
+print_status "Web application setup completed!"
+print_status "To start development server: cd ~/iot_web_monitor && npm start"
+EOF
+
+chmod +x ~/setup_web_app.sh
+
+# Step 18: Create test scripts
+print_status "Creating test scripts..."
+cat > ~/test_system.sh << 'EOF'
+#!/bin/bash
+# Comprehensive system test script
+
+print_status() {
+    echo -e "\033[0;32m[INFO]\033[0m $1"
+}
+
+print_error() {
+    echo -e "\033[0;31m[ERROR]\033[0m $1"
+}
+
+print_success() {
+    echo -e "\033[1;32m[SUCCESS]\033[0m $1"
+}
+
+FAILED_TESTS=0
+
+echo "=========================================="
+echo "IoT System Comprehensive Test"
+echo "=========================================="
+
+# Test 1: Network connectivity
+print_status "Testing network connectivity..."
+if ping -c 3 8.8.8.8 > /dev/null 2>&1; then
+    print_success "Internet connectivity: OK"
+else
+    print_error "Internet connectivity: FAILED"
+    ((FAILED_TESTS++))
+fi
+
+# Test 2: Static IP configuration
+print_status "Testing static IP configuration..."
+CURRENT_IP=$(ip addr show wlan0 | grep "inet " | awk '{print $2}' | cut -d'/' -f1)
+if [ "$CURRENT_IP" = "192.168.1.100" ]; then
+    print_success "Static IP configuration: OK ($CURRENT_IP)"
+else
+    print_error "Static IP configuration: FAILED (Current: $CURRENT_IP, Expected: 192.168.1.100)"
+    ((FAILED_TESTS++))
+fi
+
+# Test 3: Database accessibility
+print_status "Testing database..."
+if [ -f ~/iot_gateway/iot_data.db ]; then
+    NODE_COUNT=$(sqlite3 ~/iot_gateway/iot_data.db "SELECT COUNT(*) FROM node_controls;")
+    if [ "$NODE_COUNT" = "8" ]; then
+        print_success "Database: OK (8 nodes configured)"
+    else
+        print_error "Database: FAILED (Expected 8 nodes, found $NODE_COUNT)"
+        ((FAILED_TESTS++))
+    fi
+else
+    print_error "Database: FAILED (Database file not found)"
+    ((FAILED_TESTS++))
+fi
+
+# Test 4: Service status
+print_status "Testing IoT Gateway service..."
+if systemctl is-active --quiet iot-gateway.service; then
+    print_success "IoT Gateway service: RUNNING"
+else
+    print_error "IoT Gateway service: NOT RUNNING"
+    ((FAILED_TESTS++))
+fi
+
+# Test 5: API endpoints
+print_status "Testing API endpoints..."
+if curl -s http://localhost:5000/health > /dev/null; then
+    print_success "Health endpoint: OK"
+else
+    print_error "Health endpoint: FAILED"
+    ((FAILED_TESTS++))
+fi
+
+if curl -s http://localhost:5000/api/dashboard > /dev/null; then
+    print_success "Dashboard endpoint: OK"
+else
+    print_error "Dashboard endpoint: FAILED"
+    ((FAILED_TESTS++))
+fi
+
+# Test 6: Data submission test
+print_status "Testing data submission..."
+RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:5000/api/data \
+  -H "Content-Type: application/json" \
+  -d '{
+    "node_id": 99,
+    "node_type": "test",
+    "temperature": 25.5,
+    "humidity": 60.0,
+    "relay_state": false,
+    "manual_mode": false
+  }')
+
+if [ "$RESPONSE" = "200" ]; then
+    print_success "Data submission: OK"
+    # Clean up test data
+    sqlite3 ~/iot_gateway/iot_data.db "DELETE FROM sensor_data WHERE node_id = 99;"
+else
+    print_error "Data submission: FAILED (HTTP $RESPONSE)"
+    ((FAILED_TESTS++))
+fi
+
+# Test 7: Control endpoint test
+print_status "Testing control functionality..."
+CONTROL_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:5000/api/control/1 \
+  -H "Content-Type: application/json" \
+  -d '{"manual_mode": true, "relay_command": true}')
+
+if [ "$CONTROL_RESPONSE" = "200" ]; then
+    print_success "Control functionality: OK"
+    # Reset to default
+    curl -s -X POST http://localhost:5000/api/control/1 \
+      -H "Content-Type: application/json" \
+      -d '{"manual_mode": false, "relay_command": false}' > /dev/null
+else
+    print_error "Control functionality: FAILED (HTTP $CONTROL_RESPONSE)"
+    ((FAILED_TESTS++))
+fi
+
+# Test 8: Log files
+print_status "Testing log files..."
+if [ -f ~/logs/gateway.log ]; then
+    LOG_SIZE=$(stat -f%z ~/logs/gateway.log 2>/dev/null || stat -c%s ~/logs/gateway.log)
+    if [ "$LOG_SIZE" -gt 0 ]; then
+        print_success "Log files: OK"
+    else
+        print_error "Log files: EMPTY"
+        ((FAILED_TESTS++))
+    fi
+else
+    print_error "Log files: NOT FOUND"
+    ((FAILED_TESTS++))
+fi
+
+echo ""
+echo "=========================================="
+echo "Test Summary"
+echo "=========================================="
+if [ $FAILED_TESTS -eq 0 ]; then
+    print_success "All tests passed! System is ready for production."
+    echo ""
+    echo "Next steps:"
+    echo "1. Flash ESP32 nodes with the provided code"
+    echo "2. Configure WiFi settings on each ESP32"
+    echo "3. Set up web/mobile applications"
+    echo "4. Start monitoring your IoT system!"
+else
+    print_error "Failed tests: $FAILED_TESTS"
+    echo ""
+    echo "Please fix the failed tests before proceeding."
+    echo "Check the logs and configuration files."
+fi
+echo "=========================================="
+EOF
+
+chmod +x ~/test_system.sh
+
+# Step 19: Final setup tasks
+print_status "Completing final setup tasks..."
+
+# Create logs directory
+mkdir -p ~/logs
+
+# Set proper permissions
+chmod +x ~/iot_gateway/app.py
+chmod 664 ~/iot_gateway/iot_data.db
+
+# Step 20: Display completion message
+echo ""
+echo "=========================================="
+echo "IoT Gateway Setup Completed Successfully!"
+echo "=========================================="
+echo ""
+echo "Configuration Summary:"
+echo "- Static IP: ${STATIC_IP}"
+echo "- Gateway IP: ${GATEWAY_IP}"
+echo "- Database: ~/iot_gateway/iot_data.db"
+echo "- Service: iot-gateway.service"
+echo ""
+echo "Available Commands:"
+echo "- Test system: ~/test_system.sh"
+echo "- Monitor system: ~/monitor_system.sh"
+echo "- Database cleanup: ~/cleanup_database.sh"
+echo "- Start development: ~/start_gateway.sh"
+echo "- Generate ESP32 configs: ~/generate_esp32_config.py"
+echo "- Setup web app: ~/setup_web_app.sh"
+echo ""
+echo "Service Management:"
+echo "- Start: sudo systemctl start iot-gateway.service"
+echo "- Stop: sudo systemctl stop iot-gateway.service"
+echo "- Status: sudo systemctl status iot-gateway.service"
+echo "- Logs: sudo journalctl -u iot-gateway.service -f"
+echo ""
+echo "Next Steps:"
+echo "1. Restart Raspberry Pi to apply network changes"
+echo "2. Run test script: ~/test_system.sh"
+echo "3. Generate ESP32 configurations: python3 ~/generate_esp32_config.py"
+echo "4. Flash ESP32 nodes with appropriate code"
+echo "5. Setup web/mobile applications"
+echo ""
+echo "IMPORTANT: Please restart your Raspberry Pi now!"
+echo "sudo reboot"
+echo "=========================================="

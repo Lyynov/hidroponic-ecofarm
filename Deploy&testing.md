@@ -176,7 +176,362 @@ GND        -> TDS GND, Relay GND
 // Node 3 (Exhaust): NODE_ID = 3
 // Node 4 (Exhaust): NODE_ID = 4
 // Node 5 (Pompa): NODE_ID = 5
-// Node 6 (Pom# Proyek IoT Terdistribusi ESP32-Raspberry Pi
+// Node 6 (Pompa): NODE_ID = 6
+// Node 7 (Pompa): NODE_ID = 7
+// Node 8 (Pompa): NODE_ID = 8
+
+// Langkah flashing:
+// 1. Connect ESP32 ke laptop via USB
+// 2. Select Board: "ESP32 Dev Module"
+// 3. Select Port: COM port yang sesuai
+// 4. Ubah NODE_ID di kode sesuai node
+// 5. Upload code
+// 6. Open Serial Monitor untuk debug
+```
+
+### 6.6 Web Application Setup
+
+```bash
+# Setup React web application
+mkdir ~/iot_web_monitor
+cd ~/iot_web_monitor
+
+# Create React app
+npx create-react-app . --template typescript
+npm install axios recharts @types/recharts
+
+# Install Tailwind CSS
+npm install -D tailwindcss postcss autoprefixer @tailwindcss/forms
+npx tailwindcss init -p
+
+# Configure tailwind.config.js
+cat > tailwind.config.js << 'EOF'
+module.exports = {
+  content: [
+    "./src/**/*.{js,jsx,ts,tsx}",
+  ],
+  theme: {
+    extend: {},
+  },
+  plugins: [
+    require('@tailwindcss/forms'),
+  ],
+}
+EOF
+
+# Configure src/index.css
+cat > src/index.css << 'EOF'
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+EOF
+
+# Start development server
+npm start
+```
+
+### 6.7 Mobile App Setup (Flutter)
+
+```bash
+# Install Flutter (if not installed)
+# Download dari: https://docs.flutter.dev/get-started/install
+
+# Create Flutter project
+mkdir ~/iot_mobile_app
+cd ~/iot_mobile_app
+flutter create .
+
+# Edit pubspec.yaml dengan dependencies yang sudah disediakan
+
+# Install dependencies
+flutter pub get
+
+# Test run pada emulator atau device
+flutter run
+
+# Build APK untuk testing
+flutter build apk --debug
+```
+
+### 6.8 System Integration Testing
+
+#### Step 1: Test Raspberry Pi Server
+```bash
+# Start server
+cd ~/iot_gateway
+source venv/bin/activate
+python app.py
+
+# Server should show:
+# IoT Gateway Server starting...
+# Database initialized
+# Server running at http://0.0.0.0:5000
+```
+
+#### Step 2: Test ESP32 Connections
+```bash
+# Check ESP32 serial output untuk setiap node:
+# WiFi connected!
+# IP address: 192.168.1.xxx
+# Data sent successfully: 200
+```
+
+#### Step 3: Test Data Flow
+```bash
+# Monitor database real-time
+watch -n 5 'sqlite3 ~/iot_gateway/iot_data.db "SELECT node_id, node_type, temperature, humidity, tds, relay_state, timestamp FROM sensor_data ORDER BY timestamp DESC LIMIT 10;"'
+
+# Check API endpoints
+curl http://192.168.1.100:5000/api/dashboard | jq
+curl http://192.168.1.100:5000/api/nodes | jq
+```
+
+#### Step 4: Test Control Functions
+```bash
+# Test manual control
+curl -X POST http://192.168.1.100:5000/api/control/1 \
+  -H "Content-Type: application/json" \
+  -d '{"manual_mode": true, "relay_command": true}'
+
+# Verify ESP32 menerima command (check serial monitor)
+# Manual mode: ON
+# Manual relay command: ON
+```
+
+### 6.9 Performance Monitoring
+
+#### Monitor System Resources
+```bash
+# Create monitoring script
+cat > ~/monitor_system.sh << 'EOF'
+#!/bin/bash
+echo "=== IoT System Status ==="
+echo "Date: $(date)"
+echo ""
+
+echo "=== Raspberry Pi Resources ==="
+echo "CPU Usage:"
+top -bn1 | grep "Cpu(s)" | awk '{print $2 $3 $4 $5}'
+echo "Memory Usage:"
+free -h
+echo "Disk Usage:"
+df -h | grep -E "(root|home)"
+echo ""
+
+echo "=== Network Status ==="
+echo "WiFi Status:"
+iwconfig wlan0 | grep -E "(ESSID|Signal|Bit Rate)"
+echo "Active Connections:"
+netstat -an | grep :5000 | wc -l
+echo ""
+
+echo "=== Database Status ==="
+echo "Database size:"
+ls -lh ~/iot_gateway/iot_data.db
+echo "Total records:"
+sqlite3 ~/iot_gateway/iot_data.db "SELECT COUNT(*) FROM sensor_data;"
+echo "Recent records (last 10):"
+sqlite3 ~/iot_gateway/iot_data.db "SELECT node_id, node_type, timestamp FROM sensor_data ORDER BY timestamp DESC LIMIT 10;"
+echo ""
+
+echo "=== Service Status ==="
+systemctl is-active iot-gateway.service
+systemctl status iot-gateway.service --no-pager -l
+EOF
+
+chmod +x ~/monitor_system.sh
+```
+
+#### Database Maintenance
+```bash
+# Create database cleanup script
+cat > ~/cleanup_database.sh << 'EOF'
+#!/bin/bash
+cd ~/iot_gateway
+source venv/bin/activate
+
+# Backup current database
+cp iot_data.db "backup/iot_data_$(date +%Y%m%d_%H%M%S).db"
+
+# Delete records older than 30 days
+sqlite3 iot_data.db "DELETE FROM sensor_data WHERE timestamp < datetime('now', '-30 days');"
+
+# Vacuum database to reclaim space
+sqlite3 iot_data.db "VACUUM;"
+
+echo "Database cleanup completed at $(date)"
+EOF
+
+chmod +x ~/cleanup_database.sh
+
+# Setup automatic cleanup (crontab)
+(crontab -l 2>/dev/null; echo "0 2 * * 0 ~/cleanup_database.sh >> ~/cleanup.log 2>&1") | crontab -
+```
+
+### 6.10 Troubleshooting Guide
+
+#### Problem 1: ESP32 tidak konek WiFi
+```
+Symptoms: ESP32 terus print "Connecting to WiFi..."
+Solutions:
+1. Periksa SSID dan password WiFi
+2. Pastikan WiFi 2.4GHz (bukan 5GHz)
+3. Reset ESP32 dan coba lagi
+4. Periksa jarak ke router WiFi
+```
+
+#### Problem 2: Data tidak masuk database
+```
+Symptoms: Database kosong, ESP32 print error code
+Solutions:
+1. Cek IP address Raspberry Pi: ip addr show
+2. Test API endpoint: curl http://192.168.1.100:5000/health
+3. Periksa firewall: sudo ufw status
+4. Restart server: sudo systemctl restart iot-gateway.service
+```
+
+#### Problem 3: Web/Mobile tidak bisa akses data
+```
+Symptoms: Error network, CORS issues
+Solutions:
+1. Periksa IP address di konfigurasi
+2. Test dari browser: http://192.168.1.100:5000/api/dashboard
+3. Periksa CORS settings di Flask app
+4. Pastikan laptop dan Pi dalam network yang sama
+```
+
+#### Problem 4: Sensor readings tidak akurat
+```
+DHT22 Issues:
+- Pastikan wiring benar (VCC, GND, Data)
+- Cek supply voltage (3.3V)
+- Tambah delay antar pembacaan
+
+TDS Issues:
+- Kalibrasi dengan larutan standar
+- Periksa probe condition
+- Adjust TDS_FACTOR dalam kode
+```
+
+#### Problem 5: Relay tidak berfungsi
+```
+Symptoms: Relay tidak clicking, device tidak menyala
+Solutions:
+1. Periksa wiring relay (IN, VCC, GND)
+2. Test dengan LED dahulu
+3. Periksa tegangan supply relay
+4. Gunakan optocoupler untuk isolasi
+```
+
+### 6.11 System Optimization
+
+#### ESP32 Power Management
+```cpp
+// Tambah di ESP32 code untuk hemat power
+void optimizePower() {
+  // Reduce WiFi power
+  WiFi.setTxPower(WIFI_POWER_11dBm);
+  
+  // Use light sleep between operations
+  esp_sleep_enable_timer_wakeup(1000000); // 1 second
+  esp_light_sleep_start();
+}
+```
+
+#### Database Optimization
+```sql
+-- Create indexes untuk faster queries
+CREATE INDEX idx_sensor_data_node_timestamp ON sensor_data(node_id, timestamp);
+CREATE INDEX idx_sensor_data_timestamp ON sensor_data(timestamp);
+CREATE INDEX idx_node_controls_updated ON node_controls(updated_at);
+```
+
+#### Network Optimization
+```bash
+# Optimize Raspberry Pi network settings
+echo 'net.core.rmem_max = 16777216' | sudo tee -a /etc/sysctl.conf
+echo 'net.core.wmem_max = 16777216' | sudo tee -a /etc/sysctl.conf
+sudo sysctl -p
+```
+
+## 7. ADVANCED FEATURES
+
+### 7.1 Email Alerts
+```python
+# Tambah email notification untuk kondisi critical
+import smtplib
+from email.mime.text import MIMEText
+
+def send_alert(node_id, message):
+    msg = MIMEText(f"Alert from Node {node_id}: {message}")
+    msg['Subject'] = 'IoT System Alert'
+    msg['From'] = 'iot@yourdomain.com'
+    msg['To'] = 'admin@yourdomain.com'
+    
+    smtp_server = smtplib.SMTP('smtp.gmail.com', 587)
+    smtp_server.starttls()
+    smtp_server.login('your_email', 'your_password')
+    smtp_server.send_message(msg)
+    smtp_server.quit()
+```
+
+### 7.2 Data Export
+```python
+# Export data ke CSV
+@app.route('/api/export/<int:node_id>', methods=['GET'])
+def export_data(node_id):
+    import csv
+    import io
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        SELECT * FROM sensor_data 
+        WHERE node_id = ? 
+        ORDER BY timestamp DESC
+    ''', (node_id,))
+    
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['ID', 'Node ID', 'Type', 'Temperature', 'Humidity', 'TDS', 'Relay State', 'Timestamp'])
+    writer.writerows(cursor.fetchall())
+    
+    conn.close()
+    
+    response = make_response(output.getvalue())
+    response.headers['Content-Type'] = 'text/csv'
+    response.headers['Content-Disposition'] = f'attachment; filename=node_{node_id}_data.csv'
+    
+    return response
+```
+
+### 7.3 Real-time Updates (WebSocket)
+```python
+# Tambah WebSocket support untuk real-time updates
+from flask_socketio import SocketIO, emit
+
+socketio = SocketIO(app, cors_allowed_origins="*")
+
+@socketio.on('connect')
+def handle_connect():
+    print('Client connected')
+    emit('status', {'msg': 'Connected to IoT Gateway'})
+
+def broadcast_update(data):
+    socketio.emit('sensor_update', data)
+```
+
+Sistem IoT Anda sekarang sudah lengkap dengan semua komponen yang diperlukan. Pastikan untuk mengikuti langkah-langkah testing secara bertahap dan monitor performa sistem secara berkala.# Proyek IoT Terdistribusi ESP32-Raspberry Pi
 ## Arsitektur Sistem Lengkap
 
 ### 📋 Daftar Komponen
